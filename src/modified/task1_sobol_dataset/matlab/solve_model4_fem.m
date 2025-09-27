@@ -160,8 +160,19 @@ Pv0 = zeros(10,1);
 Pv0(1) = mc*9.81;
 for j = 1:8
     if train_pos(j) >= 0 && train_pos(j) <= s*L
-        element_cur = ceil(train_pos(j)/Le);
-        x = mod(train_pos(j),Le);
+        pos = train_pos(j);
+
+if pos <= 0
+    element_cur = 1;
+    x = 0;
+elseif pos >= s*L
+    element_cur = s*e;
+    x = Le;   % 落在最后一个单元右端
+else
+    element_cur = ceil(pos/Le);       % 单元号，保证 ≥1
+    x = pos - (element_cur-1)*Le;     % 单元内局部坐标
+end
+
         N1 = 1-3*(x/Le)^2+2*(x/Le)^3;
         N2 = ((x/Le)-2*(x/Le)^2+(x/Le)^3)*Le;
         N3 = 3*(x/Le)^2-2*(x/Le)^3;
@@ -184,8 +195,19 @@ av(:,1) = Mv\(Pv0-Cv*vv(:,1)-Kv*yv(:,1));
 Pb0 = zeros(2*n+s-1,1);
 for j = 1:8
     if train_pos(j) >= 0 && train_pos(j) <= s*L
-        element_cur = ceil(train_pos(j)/Le);
-        x = mod(train_pos(j),Le);
+        pos = train_pos(j);
+
+if pos <= 0
+    element_cur = 1;
+    x = 0;
+elseif pos >= s*L
+    element_cur = s*e;
+    x = Le;   % 落在最后一个单元右端
+else
+    element_cur = ceil(pos/Le);       % 单元号，保证 ≥1
+    x = pos - (element_cur-1)*Le;     % 单元内局部坐标
+end
+
         N1 = 1-3*(x/Le)^2+2*(x/Le)^3;
         N2 = ((x/Le)-2*(x/Le)^2+(x/Le)^3)*Le;
         N3 = 3*(x/Le)^2-2*(x/Le)^3;
@@ -228,8 +250,19 @@ for i = 2:length(t)
         Pv(1) = mc*9.81;
         for j = 1:8
             if train_pos(j) >= 0 && train_pos(j) <= s*L
-                element_cur = ceil(train_pos(j)/Le);
-                x = mod(train_pos(j),Le);
+                pos = train_pos(j);
+
+if pos <= 0
+    element_cur = 1;
+    x = 0;
+elseif pos >= s*L
+    element_cur = s*e;
+    x = Le;   % 落在最后一个单元右端
+else
+    element_cur = ceil(pos/Le);       % 单元号，保证 ≥1
+    x = pos - (element_cur-1)*Le;     % 单元内局部坐标
+end
+
                 N1 = 1-3*(x/Le)^2+2*(x/Le)^3;
                 N2 = ((x/Le)-2*(x/Le)^2+(x/Le)^3)*Le;
                 N3 = 3*(x/Le)^2-2*(x/Le)^3;
@@ -258,8 +291,19 @@ for i = 2:length(t)
         Pb = zeros(2*n+s-1,1);
         for j = 1:8
             if train_pos(j) >= 0 && train_pos(j) <= s*L
-                element_cur = ceil(train_pos(j)/Le);
-                x = mod(train_pos(j),Le);
+                pos = train_pos(j);
+
+if pos <= 0
+    element_cur = 1;
+    x = 0;
+elseif pos >= s*L
+    element_cur = s*e;
+    x = Le;   % 落在最后一个单元右端
+else
+    element_cur = ceil(pos/Le);       % 单元号，保证 ≥1
+    x = pos - (element_cur-1)*Le;     % 单元内局部坐标
+end
+
                 N1 = 1-3*(x/Le)^2+2*(x/Le)^3;
                 N2 = ((x/Le)-2*(x/Le)^2+(x/Le)^3)*Le;
                 N3 = 3*(x/Le)^2-2*(x/Le)^3;
