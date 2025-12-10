@@ -1,0 +1,923 @@
+
+%selectfile STDOUT
+### Writing warpper file um.c
+%openfile um="um.c" 
+%selectfile um
+
+%with CompiledModel
+#include <float.h>
+#include <math.h>
+#include "rt_nonfinite.h"
+#include "%<Name>.c"
+
+#ifndef UNIX
+#define LINKDLL                         __declspec(dllexport)
+#else
+#define LINKDLL
+#endif
+
+%% check for discrete states (i.e., non-empty DWork struct)
+%% note that is is possible to have no discrete states but have a non-empty MdlUpdate function (with SFunction calls), which is why
+%% ...the old method of looking for an empty mdlUpdate function to report discrete states does not work properly
+%%(partially from blocklib.tlc, LibBlockDWorkUsedAsDiscreteState)
+%assign discrete_states_exist = 0
+%foreach dwork_index = CompiledModel.DWorks.NumDWorks
+  %assign dwRec = CompiledModel.DWorks.DWork[dwork_index]
+  %if(dwRec.UsedAs == "DSTATE")
+    %assign discrete_states_exist = CompiledModel.DWorks.NumDWorks
+    %break
+  %endif
+%endforeach
+   
+%if discrete_states_exist
+/* These are used report all discrete values or not, in conjunction with NUM_DISCRETE_SAMP_TIME below*/
+/* Discrete State(s) exist */
+#define DISCRETE_STATES_EXIST           1 /* 1 = true */
+%else
+/* Discrete State(s) do not exist */
+#define DISCRETE_STATES_EXIST           0 /* 0 = false */
+%endif
+
+%%check for any discrete sample times (!=0)
+
+%% Note a "fixed in minor step" (i.e., [0,1]) sample time is considered a discrete sample time
+%assign num_discrete_samp_time = CompiledModel.NumSynchronousSampleTimes-LibIsContinuous(0)
+/* number of discrete sample times in the model - note that a model can have no discrete states but have discrete sample times for MdlOutput */
+/* this is used to create one dummy discrete state if DISCRETE_STATES_EXIST = 0 so that GSE_UPDATE/GSE_SAMP is called */
+#define NUM_DISCRETE_SAMP_TIME                 %<num_discrete_samp_time>
+
+%%the following below returns the number of non-zero sample times - informational-only
+%assign num_nonzero_samp_time = 0
+%foreach sample_time_index = CompiledModel.NumSampleTimes
+  %assign sample_time = CompiledModel.SampleTime[sample_time_index]
+  %if(sample_time.PeriodAndOffset[0] > 0.0)
+      %assign num_nonzero_samp_time = num_nonzero_samp_time + 1
+  %endif
+%endforeach
+#define NUM_NONZERO_SAMP_TIME                  %<num_nonzero_samp_time> /* informational-only */
+
+
+/*used to compare states' values to signal the need for an integrator restart */
+#define SMALL_VALUE 1.0e-8
+
+/* Check to see if zero-crossing function exists */
+%assign num_zcs = CompiledModel.NumNonsampledZCs
+#define NUM_NONSAMPLED_ZCS                %<num_zcs>
+
+
+/* get the parameters from the model */
+%if !LibParametersStructIsEmpty()
+static char* para_names[] = { 
+  %assign num_para = 0
+  %with ModelParameters
+    %if NumParameters > 0
+      %foreach prmIdx = NumInrtP
+	%assign mdlParam = Parameter[prmIdx]
+	%%access size of the matrix with this LibBlockParametersDimensions
+	%%to get proper size before matrix collapses
+	%assign size = LibBlockParameterDimensions(mdlParam)
+	%assign nRows = size[0]
+	%assign nCols = size[1]	
+	%if nRows > 0 && nCols > 0
+	    %if (nRows*nCols) == 1
+	      %assign pName = mdlParam.Identifier
+	      "%<pName>",
+	    %else
+	      %% check <model_name>_data.c for parameter data format
+	      %% should be ordered by columns, thus start with cols
+	      %% add 1 to indices to be 1-based to match matlab convention
+	      %foreach Cols = nCols
+	        %assign Cols = Cols + 1
+		%foreach Rows = nRows
+		  %assign Rows = Rows + 1
+		  %assign pName = mdlParam.Identifier
+		  %assign pName = pName + "_%<Rows>" + "_%<Cols>"
+		  "%<pName>",
+		%endforeach
+	      %endforeach
+	    %endif
+	%endif
+      %endforeach
+    %endif    %% NumParameters > 0
+  %endwith    %% ModelParameters
+         "null"
+};
+%else
+static char* para_names[] = { 
+         "null"
+};
+%endif
+
+/* structure to store sample time information*/
+
+/* dummy variables/functions for mat file input to inport which UM does not use/support */const char *gblInportFileName = NULL;
+rtInportTUtable *gblInportTUtables = NULL;
+int_T rt_getTimeIdx(real_T *timePtr, real_T t, int_T numTimePoints, int_T preTimeIdx, boolean_T interp){return -1;}
+void rt_Interpolate_Datatype(void *x1, void *x2, void *yout, real_T t, real_T t1, real_T t2, int outputDType){}
+typedef struct TimingData_tag {
+  int_T num_hits_now[NUMST]; /*number of hits made by the discrete state at the sample times used to compute projected_time */
+  real_T projected_time[NUMST]; /*next sample time for the discrete state; = num_hits_now*period+offset */
+  int_T current_active_tid[NUMST]; /*true(1)/false(0): true = current sample time is used for next call by GSE_SAMP */
+  int_T firstDiscIdx; /*first discrete index in array of sample times (typically, 0 = first continuous unless no continuous states exist) */
+} TimeingData;
+static TimeingData TD={0};
+
+#if NCSTATES != 0
+static XDot rtDX;
+#endif
+
+static int init=0; /* initialization flag: 0 = not initialized; 1 = yes */
+static int need_reset = 0; /* flag for sensor/sensub to indicate if um integrator needs restart  */
+static char error_msg[257] = {0}; /* set by any function; used by SIM_GetException*/
+
+
+LINKDLL void _cdecl SIM_GetVersionNumber(char *version, int *status) 
+{
+  char ver[]="UM 7"; 
+  strcpy(version, ver);
+  *status = 0;
+}
+
+LINKDLL void _cdecl SIM_GetSourceCreator(char *pname, int *status) 
+{
+  char program[] = "MATLAB/RTW";
+  strcpy(pname, program);
+  *status = 0;
+}
+
+LINKDLL void _cdecl SIM_Clear_Nonzero_SampleHit(void) 
+{
+  int_T i;
+  int_T *sampleHit = ssGetSampleHitPtr((&model_S));
+
+  /* reset just the discrete sample times since continuous sample times should always hit */
+  for(i= TD.firstDiscIdx; i< NUMST; i++) sampleHit[i] = 0;
+
+  return; 
+}
+
+LINKDLL void _cdecl SIM_Initialize(int *status) 
+{
+  int_T i;
+
+#if NCSTATES != 0
+  real_T *dx = (real_T *) &rtDX;  /*continuous state derivatives */
+#endif
+
+  real_T *period; /* sample time periods */
+  real_T *offset; /* sample time offsets */
+  int_T *sampleHit; /*flag used by Matlab to determine if sample time has been hit (does not figure out itself) */
+
+  if(init) return; /* do nothing if already initialized */
+  
+  /*initialize Simulink/RTW model*/
+   rt_InitInfAndNaN(sizeof(real_T));
+   rtMinusInf = -1.0e37;
+   rtInf = 1.0e37;
+
+  (void) MODEL(); /* simulink/rtw model */
+
+#if NCSTATES != 0
+   ssSetdX((&model_S), dx); /*??*/
+#endif
+
+  ssSetNumContStates((&model_S), NCSTATES); /*??*/
+  ssSetT((&model_S), (real_T)0.0);
+/*  if (ssGetErrorStatus((&model_S)) != NULL) {
+    (void)fprintf(stderr,"Error during model registration: %s\n",
+     ssGetErrorStatus((&model_S)));
+    exit(EXIT_FAILURE);
+  }
+*/
+  MdlInitializeSizes();
+  MdlInitializeSampleTimes(); /*simply set the sample times for continuous/discrete states */
+
+#if DISCRETE_STATES_EXIST == 1
+  {
+  int temp;
+  temp = (int)(sizeof(D_Work)/sizeof(real_T));
+  if (sizeof(D_Work) != temp*sizeof(real_T)) 
+     {
+        temp = 1;
+     }
+  
+  ssSetNumDWork((&model_S), temp);
+  }
+#endif
+
+/* always set to major time step, since could be at any output time in UM */
+/* this is assumed to be the default for all calls to output unless it is explicitly set to MINOR_TIME_STEP */
+/* See SIM_GetPartials() for example. */
+/* In MATLAB models, ssIsSampleHit() returns true only for MAJOR_TIME_STEP and SINGLETASKING execution (vs. MULTITASKING), and sampleHit flag = 1*/
+
+ssSetSimTimeStep((&model_S),MAJOR_TIME_STEP);
+ /*
+  Note that it is possible for the MATLAB model to check for major step (i.e., output point)  
+  (e.g., ssIsMajorTimeStep(...))in the output.
+  See rtw/thermo_test for example which uses relay block; rtw_sfunc/sfcndemo_sfun_zc;
+  This may only be needed when using the fixed-step integrator setting in Matlab (variable-step int. setting recommended).
+  Fixed-step setting may add a sample time just for the fixed-step size.
+ */
+
+  period = ssGetSampleTimePtr((&model_S));
+  offset = ssGetOffsetTimePtr((&model_S));
+  sampleHit = ssGetSampleHitPtr((&model_S));
+
+/*Next, find the index for the first non-zero sample time so that can loop over only these discrete (non-zero) times. */
+
+/* From Simulink file: simstruc.h
+ * Task ID's ordering
+ *      Continuous task
+ *      Continuous but fixed in minor step task
+ *      Discrete task 1
+ *         ...
+ *      Discrete task N
+ *      Variable sample time task(s), offset is instance number.
+ *
+ * If continuous task is present then it's task ID is 0, otherwise the
+ * first discrete task ID will be 0 if it is present, etc.
+ * All blocks with varying sample times have same sample task period of -2,
+ * and the offset is the instance number.
+ *
+ * The triggered blocks are not in the sample time table and have a task ID
+ * of -1.
+ */
+
+/* search for special case sample times*/
+ for(i=0; i< NUMST; i++)
+ {
+     if(period[i] == -2) /* variable sample time */
+     {
+        *status = 1; /* ERROR - variable sample time not supported */
+        strcpy(error_msg, "Variable sample time not supported in MATLAB/RTW.  Please remove the variable sample time and regenerate DLL.");
+        return;
+     }
+ }
+
+/* search for index of first non-zero sample time */
+ for(i=0; i< NUMST; i++)
+ {
+     if(period[i] != CONTINUOUS_SAMPLE_TIME)
+     {
+         break;
+     }
+ }
+TD.firstDiscIdx = i; /* set index of first non-zero sample time */
+
+/* initialize sampleHit array */
+  /*reset all discrete sample times - will check which sample times hit later */
+  SIM_Clear_Nonzero_SampleHit();
+
+/*continuous sample time always hits (if exists) */
+  for(i=0; i< TD.firstDiscIdx; i++) sampleHit[i] = 1;
+
+/* set the initial sample time data*/
+  for(i= TD.firstDiscIdx; i< NUMST; i++) 
+  {
+    TD.current_active_tid[i]=0;
+    TD.num_hits_now[i] = 0;
+    TD.projected_time[i] = period[i]*TD.num_hits_now[i]+offset[i];
+
+  }
+  
+  ssSetStopRequested(&model_S, 0);
+  MdlStart();
+  init = 1; /* flag to indicate this function has been called once*/
+  *status = 0;
+}
+
+
+LINKDLL void _cdecl SIM_Terminate(int* status) 
+{
+  *status = 0;
+}
+
+
+LINKDLL void _cdecl SIM_GetNumSampleTimes(int* numst, int* status)
+{
+ /* this is required to create sensor(s) and size of storage for zc values*/
+ *numst = NUMST;
+ *status = 0;
+ return;
+}
+
+
+LINKDLL void _cdecl SIM_GetSampleTimePeriodsPtr(double** st_period, int* status)
+{
+  *st_period = ssGetSampleTimePtr((&model_S));
+  *status=0;
+}
+
+LINKDLL void _cdecl SIM_GetSampleTimeOffsetsPtr(double** st_offset, int* status)
+{
+  *st_offset = ssGetOffsetTimePtr((&model_S));
+  *status=0;
+}
+
+
+LINKDLL void _cdecl SIM_GetIndex(int *indx, int *status) 
+{
+  /* non-zero index == implicit GSE; else explicit GSE */
+  /* MATLAB/RTW always = 0 index */
+  *indx = 0;
+  *status = 0;
+}
+
+LINKDLL void _cdecl SIM_GetErrorTol(double *errtol_array, int* status) 
+{
+  /*
+   To use this, it must return errtol_array with the values of the 
+   error tolerance of all of the continuous states in the model.
+   And, return status = 0 for successful return of values.
+   Finally, the seventh parameter of the UM GSE that calls this
+   ESL must be the scale factor for this error tolerance, and this 
+   scale factor must be > 0.
+  */
+  /*returns status =1 (failed), since it not currently used*/
+  *status = 1;
+}
+  
+
+LINKDLL void _cdecl SIM_GetModelName(char* model_name, int *status) 
+{
+  /* return name of the Simulink model*/
+  int stat = 0;
+%with CompiledModel  
+  %assign pName = Name
+  char temp_name[]="%<pName>";
+%endwith
+  if (model_name != 0) 
+  {  
+    strncpy(model_name, temp_name,200);
+    model_name[200]='\0';
+  } 
+  else 
+  {
+    stat = 1;
+  }
+  *status = stat;
+  return; 
+}
+
+LINKDLL void _cdecl SIM_GetNumU(int *num, int *status) 
+{
+  *num = ssGetNumU((&model_S));
+  *status = 0;
+  return;
+}
+
+LINKDLL void _cdecl SIM_GetNumY(int *num, int *status) 
+{
+  *num = ssGetNumY((&model_S));
+  *status = 0;
+  return; 
+}
+
+LINKDLL void _cdecl SIM_GetNumX(int* num, int* status) 
+{
+  *num = ssGetNumContStates((&model_S));
+  *status = 0;
+  return;
+}
+
+
+LINKDLL void _cdecl SIM_GetNumDiscX(int *num, int* status) 
+{
+#if DISCRETE_STATES_EXIST == 0 && NUM_DISCRETE_SAMP_TIME >= 1 
+/* If no discrete states exist (continuous-only), but there are discrete sample times, then
+   need to call GSE_UPDATE to update sampled outputs by setting one dummy discrete state */
+  *num = 1;
+#else 
+/* Return actual number of discrete states for models with discrete states or continuous-only models without discrete sample times*/
+  *num = ssGetNumDWork((&model_S));
+#endif
+  *status = 0;
+  return;
+}
+
+LINKDLL void _cdecl SIM_GetNumParameters(int *num, int* status) 
+{
+%if !LibParametersStructIsEmpty()
+    *num = (int)(sizeof(P)/sizeof(real_T));
+%else
+    *num = 0;
+%endif
+   *status = 0;
+    return;
+}
+
+LINKDLL void _cdecl SIM_GetParameters(double *values, int* status) 
+{
+
+%if !LibParametersStructIsEmpty()
+    int i;
+    for(i=0; i < ((int)(sizeof(P)/sizeof(real_T))); i++) 
+    {
+        values[i] = ((double*) (&rtP))[i];
+    }
+%else
+/*returns values = 0 if no parameters exist */
+    *values = 0;
+%endif
+    *status = 0;
+    return;
+}
+
+LINKDLL void _cdecl SIM_GetParameterName(int i, char* para_name, int *status) {
+  int stat = 0;
+  if (para_name) {
+    strcpy(para_name, para_names[i]);
+  } 
+  else 
+  {
+    stat = 1;
+  }
+  *status = stat;
+}
+
+LINKDLL void _cdecl SIM_SetParameters(int numpara, double* para, int *status) 
+{
+%if !LibParametersStructIsEmpty()
+  (void) memcpy(&rtP, para, sizeof(real_T)*numpara);
+%else
+/*does nothing if no parameters exist */
+%endif
+  *status = 0;
+}
+
+LINKDLL void _cdecl SIM_GetX(double *value, int *status) 
+{
+#if NCSTATES != 0
+  int_T tempx;
+  *status = 0;
+  SIM_GetNumX(&tempx, status);
+  if (tempx != 0)
+    (void) memcpy((real_T*)value, &rtX, sizeof(real_T)*tempx);
+#else
+  *status = 0;
+#endif
+  
+}
+
+LINKDLL void _cdecl SIM_GetDX(double time, double *U, double *X, double *value, int *status) 
+{
+#if NCSTATES != 0
+  int tempx;
+  int tempu;
+  double *dx;
+  *status = 0;
+  SIM_GetNumX(&tempx, status);
+  SIM_GetNumU(&tempu, status);
+  ssSetT((&model_S), (real_T)(time));
+#if NINPUTS != 0
+  if(!need_reset) (void) memcpy(&rtU, (real_T*)U, sizeof(real_T)*tempu);
+#endif
+  if(!need_reset) (void) memcpy(&rtX, (real_T*)X, sizeof(real_T)*tempx);
+  MdlDerivatives();
+  dx = ssGetdX((&model_S));
+  (void) memcpy((real_T*)value, dx, tempx*sizeof(real_T));
+#else
+  *status = 0;
+#endif
+  
+  return;
+}
+
+LINKDLL void _cdecl SIM_GetY(double time, double *U, double *X, double *value, int *status) {  
+  int tempx;
+  int tempu;
+  int tempy;
+  *status = 0;
+  SIM_GetNumX(&tempx, status);
+  SIM_GetNumU(&tempu, status);
+  SIM_GetNumY(&tempy, status);
+  ssSetT((&model_S), (real_T) (time));
+
+#if NCSTATES == 0
+/* if a controller is purely continuous, there is no MdlUpdate */
+/* Note:  need to evaluate the output regardless of number of sample times */
+
+#if NINPUTS != 0
+  if(!need_reset) (void) memcpy(&rtU, (real_T*)U, sizeof(real_T)*tempu);
+#endif
+  MdlOutputs(0);
+
+#if NOUTPUTS != 0
+  (void) memcpy((real_T*)value, (real_T*)&rtY, tempy*sizeof(real_T));
+#endif
+  return;
+#endif
+  /* if update continuous states only if necessary 
+   */
+#if NCSTATES != 0
+  if(!need_reset) (void) memcpy(&rtX, (real_T*)X, sizeof(real_T)*tempx);
+#endif
+#if NINPUTS != 0
+  if(!need_reset) (void) memcpy(&rtU, (real_T*)U, sizeof(real_T)*tempu);
+#endif
+  MdlOutputs(0);
+#if NOUTPUTS != 0
+  (void) memcpy((real_T*)value, (real_T*)&rtY, tempy*sizeof(real_T));
+#endif
+
+#if NCSTATES != 0
+/* for blocks/models that reset the states, need to trigger for an integrator restart via the sensor to update the states of the model to the GSE*/
+{
+  int i;
+  for (i=0; i< tempx; i++) 
+  {
+    if(fabs(X[i] - ((double*)(&rtX))[i]) > SMALL_VALUE) 
+    {
+	need_reset = 1;
+        break;
+    }
+  }
+}
+#endif
+  
+   if (ssGetStopRequested(&model_S))  /* check if ssSetStopRequested(...) has been called/set by the Simulink/RTW model */
+   {
+     *status = 1; /* returns error status */
+   }
+  return;
+}
+
+
+
+
+LINKDLL void _cdecl SIM_DeltaT(double time, double *stepsize, int* status) 
+{
+/*
+This returns the next sample time (to GSE_SAMP) by scanning all times for the earliest (non-zero) time.
+Matlab/RTW notes: All sample times in your Simulink model must be an integer multiple of the fixed-step size.
+A discrete sample time (non-zero) must be entered in a discrete Simulink block.
+If no sample time is provided explicitly to a block that inherits sample time, the sample time = simulation end time/50.
+*/
+  int_T i;
+  real_T earliest_time =10.0e+10;
+  real_T *period = ssGetSampleTimePtr((&model_S));
+  real_T *offset = ssGetOffsetTimePtr((&model_S));
+  
+
+  /*make current active tasks take one step forward and compare to all times to find earliest */
+  /* NUMST = number of sample times; set by the RTW makefile */
+  for(i= TD.firstDiscIdx; i< NUMST; i++) /*loop over only the non-zero sample times */
+  { 
+    if(TD.current_active_tid[i] == 1) 
+    {      
+      TD.num_hits_now[i]++;
+      TD.projected_time[i] = period[i]*TD.num_hits_now[i]+offset[i];    
+      TD.current_active_tid[i]=0; /*reset active id */
+    }
+  
+    /* find the earliest time */   
+    if(earliest_time > TD.projected_time[i]) 
+    {
+      earliest_time = TD.projected_time[i];
+    }
+  }
+
+  *stepsize = earliest_time - time;
+  *status = 0;
+  return; 
+}
+
+
+LINKDLL void _cdecl SIM_Set_SampleHit(double time, int* status) 
+{
+/*
+This sets the sampleHit array (flag) by scanning all times for the earliest (non-zero) time.
+It is used by the MATLAB function ssIsSampleHit(), which also requires that the major_time_step be set by:
+ssSetSimTimeStep((&model_S),MAJOR_TIME_STEP);
+This should be called before calling MdlOutput in the discrete output function (SIM_GetDiscY).
+See SIM_Initialize which performs this function at the beginning of the simulation.
+*/
+  int_T i;
+  real_T earliest_time =10.0e+10;
+  int_T *sampleHit = ssGetSampleHitPtr((&model_S));
+  
+  /*reset all discrete sample times - will check which sample times hit later */
+  SIM_Clear_Nonzero_SampleHit();
+
+/* The following should have been done in initilization, and should never need to be reset */
+/* Thus, it is commented-out */
+/*continuous sample time always hits (if exists) */
+/*
+  for(i=0; i< TD.firstDiscIdx; i++) sampleHit[i] = 1;
+ */
+
+  /* compare to all times to find earliest */
+  /* NUMST = number of sample times; set by the RTW makefile */
+  
+  for(i= TD.firstDiscIdx; i< NUMST; i++) /*loop over only the non-zero sample times */
+  { 
+    /* find the earliest time */    
+    if(earliest_time > TD.projected_time[i]) 
+    {
+        earliest_time = TD.projected_time[i];
+    }
+  }
+ 
+  for(i= TD.firstDiscIdx; i< NUMST; i++) /*loop over only the non-zero sample times */
+  { 
+    /* If there are more than one task having the same projected_time
+     as the selected one, mark them all*/
+    if (fabs(TD.projected_time[i]-earliest_time) < 1.0e-10) 
+    {
+      sampleHit[i] = 1;
+      TD.current_active_tid[i]=1;
+    }
+  }
+  *status = 0;
+  return; 
+}
+
+
+
+LINKDLL void _cdecl SIM_GetDiscY(double time, double *U, double *X, double *value, int* status) {
+#if NCSTATES == 0
+  /*If there is no continuous states, update U and discrete states only here 
+   */
+  int tempx;
+  int tempu;
+  int tempy;
+  *status = 0;
+  SIM_GetNumX(&tempx, status);
+  SIM_GetNumU(&tempu, status);
+  SIM_GetNumY(&tempy, status);
+  SIM_Set_SampleHit(time,status); /* Must set sampleHit flag(s) for IsSampleHit() function*/
+  ssSetT((&model_S), (real_T)(time));
+#if NINPUTS != 0
+  (void) memcpy(&rtU, (real_T*)U, sizeof(real_T)*tempu);
+#endif
+  MdlOutputs(0);
+  MdlUpdate(0);
+#if NOUTPUTS != 0
+  (void) memcpy((real_T*)value, (real_T*)&rtY, tempy*sizeof(real_T));
+#endif
+ SIM_Clear_Nonzero_SampleHit(); /* clear non-zero sampleHit flag(s) so that calls to SIM_GetY do not trigger the wrong sample times */
+#else
+  *status = 0;
+  SIM_Set_SampleHit(time,status); /* Must set sampleHit flag(s) for IsSampleHit() function*/
+  SIM_GetY(time, U, X, value, status); /* need to keep this status to use for error/stop conditions */
+  MdlUpdate(0);
+  SIM_Clear_Nonzero_SampleHit(); /* clear non-zero sampleHit flag(s) so that calls to SIM_GetY do not trigger the wrong sample times */
+#endif
+  return;
+}
+
+LINKDLL void _cdecl SIM_GetDiscX(double *DiscX, int* status) 
+{
+
+#if DISCRETE_STATES_EXIST == 1
+/* get the actual values of the discrete states*/
+  int temp;
+  *status = 0;
+  SIM_GetNumDiscX(&temp, status);
+  (void) memcpy((real_T*)DiscX, &rtDWork, sizeof(real_T)*temp);
+#else
+  *status = 0;
+
+ #if DISCRETE_STATES_EXIST == 0 && NUM_DISCRETE_SAMP_TIME >= 1
+
+/* If no discrete states exist (continuous-only), but there are discrete sample times, then
+   return a dummy value to the dummy state -- purpose of existence is just to call MdlOutputs at discrete sample times*/
+  *DiscX = ssGetT((&model_S));
+#else
+#endif
+#endif
+  
+  return;
+}
+
+
+
+
+LINKDLL void _cdecl SIM_GetSensorTrigger(double time, double *value, int* status) 
+{
+   *status = 0;
+   /* provides the SENSOR/FUNCTION value of the SENSUB */
+   *value = -1.0;
+   if (need_reset) 
+   {
+	*value = 1;
+   } 
+}
+
+LINKDLL void _cdecl SIM_GetUserAction(double time, int *reset, int* status) 
+{
+/* provides the SENSOR/EVALUATE value for the SEVSUB */
+/* a non-zero value of reset tells the SEVSUB to reload the GSE states after an integrator restart*/
+       *status = 0;
+       *reset = 0;
+       if(need_reset)  
+       {
+         *reset = 1;
+         need_reset = 0;
+       }
+}
+
+LINKDLL void _cdecl SIM_GetSensorAction(int *flag, char* action, double *value, int* status)
+{
+       *status = 0;
+	*flag = 0;
+	if(!strcmp(action, "restart")) 
+	{
+	   *flag = 1;
+	} 
+	else 
+	{
+	   *flag = 0;
+	}
+}
+
+
+LINKDLL void _cdecl SIM_GetException(int *severity, char *msg)
+{
+   /* This catches anything that would stop a simulation, including exceptions */
+   /* msg is limited to 257 characters from UM calls*/
+
+   /* if error_msg set by some other function, use this */
+   if(error_msg)
+   {
+     strcpy(msg, error_msg);
+     *severity = 2;
+      return;
+   }
+   else if (ssGetStopRequested(&model_S)) 
+   {
+      strcpy(msg, "Stop signal from Simulink/RTW model detected.");
+      *severity = 3;
+      return;
+   }
+   else
+   {
+     *severity = 1;
+     strcpy(msg, "Exception detected from Simulink/RTW model.");
+   }
+
+}
+
+
+LINKDLL void _cdecl SIM_GetPartials(double time, double *U, double *X, double *value, char abcd, int flag, int *status)
+{
+  int numX, numY, numU, i, j, numMax;
+  double *dp, *dm;
+  double *dyp, *dym;
+  double base_pert = 1.0e-6;
+  double abs_value;
+  double pert;
+  static double* A=0;
+  static double* B=0;
+  static double* C=0;
+  static double* D=0;
+  int is_major = 0;
+  *status = 0;  
+  SIM_GetNumX(&numX, status);
+  SIM_GetNumU(&numU, status);
+  SIM_GetNumY(&numY, status);
+  if (ssIsMajorTimeStep(&model_S)) { /* ssIsSampleHit() returns true only for MAJOR_TIME_STEP and SINGLETASKING execution (vs. MULTITASKING)*/
+     ssSetSimTimeStep((&model_S),MINOR_TIME_STEP);
+     is_major = 1;
+  }
+  i = (numX > numU) ? numX : numU;
+  numMax = (i > numY) ? i : numY;
+  if(flag) {
+    if(!A && numX) A = (double*) malloc(numX*numX*sizeof(double));
+    if(!B && numX) B = (double*) malloc(numX*numU*sizeof(double));
+    if(!C && numX) C = (double*) malloc(numX*numY*sizeof(double));
+    if(!D) D = (double*) malloc(numU*numY*sizeof(double));
+    dyp  = (double*) malloc(numMax*sizeof(double));
+    dym  = (double*) malloc(numMax*sizeof(double));
+    dp = (double*) malloc(numMax*sizeof(double));
+    dm = (double*) malloc(numMax*sizeof(double));
+    if (numX) {
+	for(i=0; i< numX; i++) 
+	{
+	  abs_value = fabs(X[i]);
+	  pert = ((abs_value > 1 ? abs_value*base_pert : base_pert));
+	  X[i] += pert;
+	  SIM_GetY (time, U, X, dyp, status) ;
+	  SIM_GetDX(time, U, X, dp, status) ;
+	  X[i] -= pert;
+	  X[i] -= pert;
+	  SIM_GetY (time, U, X, dym, status) ;
+	  SIM_GetDX(time, U, X, dm, status) ;
+	  X[i] += pert;
+	  for(j=0; j<numX; j++) 
+	  {
+ 	    A[j+i*(numX)] = (dp[j]-dm[j])/(pert+pert);
+ 	  }
+	  for(j=0; j<numY; j++) 
+	  {
+ 	    C[j+i*(numY)] = (dyp[j]-dym[j])/(pert+pert);
+ 	  }
+        }
+    }
+   if (numU) {
+	for(i=0; i< numU; i++) 
+	{
+	  abs_value = fabs(U[i]);
+	  pert = ((abs_value > 1 ? abs_value*base_pert : base_pert));
+	  U[i] += pert;
+	  SIM_GetY (time, U, X, dyp, status) ;
+	  SIM_GetDX(time, U, X, dp, status) ;
+	  U[i] -= pert;
+	  U[i] -= pert;
+	  SIM_GetY (time, U, X, dym, status) ;
+	  SIM_GetDX(time, U, X, dm, status) ;
+	  U[i] += pert;
+	  for(j=0; j<numX; j++) 
+	  {
+ 	    B[j+i*(numX)] = (dp[j]-dm[j])/(pert+pert);
+ 	  }
+	  for(j=0; j<numY; j++) 
+	  {
+ 	    D[j+i*(numY)] = (dyp[j]-dym[j])/(pert+pert);
+	  }
+	}
+    }
+    free(dyp);
+    free(dym);
+    free(dp);
+    free(dm);
+  }
+  switch(abcd) 
+  {
+      case 'A':
+      case 'a':
+             if (A) {
+               (void) memcpy(value, A, sizeof(double)*numX*numX);
+	       free(A); A=0;
+	     }
+	      break;
+      case 'B':
+      case 'b':
+             if (B) {
+               (void) memcpy(value, B, sizeof(double)*numX*numU);
+	       free(B); B=0;
+	     }
+	      break;
+      case 'C':
+      case 'c':
+             if (C) {
+               (void) memcpy(value, C, sizeof(double)*numX*numY);
+	       free(C); C=0;
+	     }
+	      break;
+      case 'D':
+      case 'd':
+             if (D) {
+               (void) memcpy(value, D, sizeof(double)*numY*numU);
+	       free(D); D=0;
+	     }
+	      break;
+      default: break;
+   }
+  
+  if (is_major) {
+     ssSetSimTimeStep((&model_S),MAJOR_TIME_STEP);
+  }
+}
+
+
+
+LINKDLL void _cdecl SIM_GetNumNonsampledZCs(int* num, int* status)
+{
+ /* this is required to create sensor(s) and size of storage for zc values*/
+ *num = ssGetNumNonsampledZCs((&model_S));
+ *status = 0;
+ return;
+}
+
+#if NUM_NONSAMPLED_ZCS > 0  /* MdlZeroCrossings() will only exist if zero-crossings exist */
+
+LINKDLL void SIM_GetNonsampledZCs(double* zc_values, int* status)
+{
+  /* set pointer to store zc values */
+  ssSetSolverZcSignalVector(((&model_S)),zc_values);
+
+  /* compute the zero-crossings, which be be saved in zc_values pointer */
+  MdlZeroCrossings();
+
+  *status = 0;
+  return;
+}
+
+LINKDLL void _cdecl SIM_GetZCThreshold(double zc_thres, int* status)
+{
+  /* get zc thresholds */
+  zc_thres = ssGetSolverZcThreshold((&model_S));
+
+  *status = 0;
+  return;
+}
+
+
+
+#endif
+%endwith
+%closefile um
+%selectfile STDOUT
+### .......done!
+%selectfile NULL_FILE

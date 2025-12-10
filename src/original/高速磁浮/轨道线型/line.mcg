@@ -1,0 +1,17 @@
+with tangent;
+  length=5000; 
+  fouter=0.25; 
+  finner=0.25; 
+  fflange=0.25; 
+with tangent;
+  length=5000; 
+  fouter=0.25; 
+  finner=0.25; 
+  fflange=0.25; 
+with zsection;
+  length=5000; 
+  fouter=0.25; 
+  finner=0.25; 
+  fflange=0.25; 
+  gradient=0; 
+  radius=0; 

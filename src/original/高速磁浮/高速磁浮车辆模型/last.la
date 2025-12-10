@@ -1,0 +1,57 @@
+align=1;
+equilibrium_type=integration;
+qr_alg4=false; 
+auto_equilibrium=false; 
+approximate_dr=false; 
+ev_approximate_max_frequency= 1.E2; 
+zero_v=false; 
+brake_singular_jacobian=true; 
+skip_equilibrium_animation=false; 
+use_threads=false; 
+n_threads=10; 
+use_lu_decomposition=false; 
+solver_ev_problem=QR; 
+qr_calculate_all_eigen_vectors=false; 
+qr_maximal_ferquency= 5.E1; 
+qr_number_eigenvectors=-1; 
+locking_carbody=true; 
+locking_tire_equilibrium=false; 
+locking_tire_rotation=true; 
+  la_accuracy=1E-8;
+  la_dx=1E-8;
+  la_relaxation=1;
+  la_niter=20;
+  ke_stop=0.001;
+  ke_dt=1;
+  tmin=1;
+  tmax=100;
+  alpha=5;
+  la_ndof_approxim=500;
+  beta_step=10;
+  lanczos_num_frequency=100;
+  flist=0,10[11];
+  with excitation;
+    name="车体; Point = (0.000; 0.000; 0.000); Amplitude = 10";
+    fcomponent=fcfx;
+    body=车体;
+    x=0;
+    y=0;
+    z=0;
+    ex=1;
+    ey=0;
+    ez=0;
+    amplitude=10;
+    freqfactor=1;
+    phase=0;
+    exctype=force;
+  with localend;
+cfrc_sticking = {
+};
+disabled_forces = {
+悬浮架1.接触力元#
+悬浮架2.接触力元#
+悬浮架3.接触力元#
+悬浮架4.接触力元#
+悬浮架5.接触力元#
+悬浮架6.接触力元#
+};

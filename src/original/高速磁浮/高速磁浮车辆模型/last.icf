@@ -1,0 +1,22 @@
+icf
+$ Configuration of object 高速磁浮车辆模型
+with integr;
+  tout    =  3.000E+0001;
+  lastparfile    = "";
+  step    =  5.000E-0003;
+  a_step_factor =    1;
+  h       =  1.000E-0003;
+  error   =  1.000E-0007;
+  error_cgm   =  1.000E-0003;
+  method  = park;
+  crelaxation_linear=1;
+  dx_linear=1E-08;
+  eps_linear=1E-08;
+  nitermax_linear=20;
+  la_must_zero_v=false;
+  la_auto_equilibrium=false;
+  qr_alg4=false;
+  la_break_singular_jm=true;
+  psolutionmethod=cgm;
+  usethreads=true;
+  nthreads=4;
