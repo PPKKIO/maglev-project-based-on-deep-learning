@@ -35,9 +35,9 @@ rayleigh = 2*[1/omega1,omega1;1/omega2,omega2]^-1*[zeta1;zeta2];
 rayleighM = rayleigh(1);
 rayleighK = rayleigh(2);
 
-s  = 8;
-e  = 50;
-num_dt = 100;
+s  = 6;
+e  = 40;
+num_dt = 25;
 
 % 初始条件
 yv0 = zeros(10,1);

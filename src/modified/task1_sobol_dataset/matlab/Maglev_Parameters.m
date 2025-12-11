@@ -41,8 +41,8 @@ save('Maglev_Parameters.mat')
 
 mv=mc+mb+mm;
 V = 500 /3.6;
-s=8;
-e=50;
+s=6;
+e=40;
 s0=20;
 
 yv0=zeros(10,1);
@@ -56,7 +56,7 @@ k=4e7;
 c=1e4;
 
 %extra dimension
-num_dt = 100;
+num_dt = 25;
 
 
 
