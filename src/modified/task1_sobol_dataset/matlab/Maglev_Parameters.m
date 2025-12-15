@@ -52,9 +52,15 @@ n=s*e+1;
 Nd = 2 * n + s - 1;
 ub0=zeros(Nd,1);
 vb0=zeros(Nd,1);
-k=4e7;
-c=1e4;
-
+%k=4e7;
+k=34567890;
+c=12345;
+%c=1e4;
+h0=0.012345;
+i0=25.67890;
+kh=5678;
+kv=78;
+V=234/3.6;
 %extra dimension
 num_dt = 25;
 
@@ -66,4 +72,5 @@ num_dt = 25;
 
 figure;
 plot(t,av(1,:));
+disp(max(abs(av(1,length(av)*0.9:end))))
 grid on;

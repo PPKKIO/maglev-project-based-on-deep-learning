@@ -4,6 +4,7 @@ with integr;
   tout    =  6.000E+0001;
   lastparfile    = "";
   step    =  5.000E-0003;
+  a_step_factor =    1;
   h       =  1.000E-0003;
   error   =  1.000E-0007;
   error_cgm   =  1.000E-0003;

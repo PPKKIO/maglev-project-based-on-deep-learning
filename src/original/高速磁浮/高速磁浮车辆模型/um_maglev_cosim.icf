@@ -2,7 +2,6 @@ icf
 $ Configuration of object 高速磁浮车辆模型
 with integr;
   tout    =  6.000E+0001;
-  lastparfile    = "";
   step    =  5.000E-0003;
   a_step_factor =    1;
   h       =  1.000E-0003;
