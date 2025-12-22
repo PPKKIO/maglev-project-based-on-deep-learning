@@ -221,6 +221,30 @@ def main():
     res.to_csv("feature_importance_lstm_perm.csv", index=False, encoding="utf-8-sig")
     print("\nSaved: feature_importance_lstm_perm.csv")
 
+    # ========= ⭐ 导出模型 + 预处理器 + 特征顺序 =========
+    import joblib, json
+
+    # 1) 保存模型权重（最关键）
+    torch.save(best_state, "lstm_state_dict.pt")
+
+    # 2) 保存标准化器（预测时必须用同一个）
+    joblib.dump(scaler, "lstm_scaler.pkl")
+
+    # 3) 保存特征顺序（手动输入必须按这个顺序）
+    with open("feature_order_lstm.json", "w", encoding="utf-8") as f:
+        json.dump(X_cols, f, ensure_ascii=False, indent=2)
+
+    # 4) 保存模型结构超参数（保证预测脚本构建结构一致）
+    lstm_meta = {"hidden": 96, "num_layers": 2, "bidir": True, "dropout": 0.25}
+    with open("lstm_meta.json", "w", encoding="utf-8") as f:
+        json.dump(lstm_meta, f, ensure_ascii=False, indent=2)
+
+    print("\nSaved model artifacts:")
+    print("  lstm_state_dict.pt")
+    print("  lstm_scaler.pkl")
+    print("  feature_order_lstm.json")
+    print("  lstm_meta.json")
+
 
 if __name__ == "__main__":
     main()
